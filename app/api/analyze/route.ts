@@ -5,7 +5,7 @@ import { checkCriteria, collectRepository } from "@/lib/github";
 import type { AnalysisReport } from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 180;
 
 const Input = z.object({
   repositoryUrl: z.string().url().max(250),
@@ -42,26 +42,41 @@ export async function POST(request: Request) {
     const body: unknown = await request.json();
     const input = Input.safeParse(body);
     if (!input.success) return NextResponse.json({ error: "Informe uma URL válida do GitHub." }, { status: 400 });
-    if (!process.env.OPENAI_API_KEY) {
-      return NextResponse.json({ error: "Configure OPENAI_API_KEY no arquivo .env.local para executar a análise real com IA." }, { status: 503 });
+    const isLocal = (process.env.AI_PROVIDER || "ollama") === "ollama";
+    if (!isLocal && !process.env.OPENAI_API_KEY) {
+      return NextResponse.json({ error: "Configure OPENAI_API_KEY para usar OpenAI, ou AI_PROVIDER=ollama para IA local gratuita." }, { status: 503 });
     }
 
     const { project, files } = await collectRepository(input.data.repositoryUrl);
     const { criteria, coverage } = checkCriteria(files);
-    const payload = files.map(x => `\n<<< INÍCIO: ${x.path} >>>\n${x.content}\n<<< FIM: ${x.path} >>>`).join("\n");
+    // Limite de contexto para modelos locais menores; evidências validadas com os arquivos lidos.
+    let budget = isLocal ? 11_000 : 38_000;
+    const selectedContext = files.flatMap(x => {
+      if (budget <= 0) return [];
+      const content = x.content.slice(0, Math.min(budget, isLocal ? 3_000 : 6_500));
+      budget -= content.length;
+      return content ? [`\n<<< INÍCIO: ${x.path} >>>\n${content}\n<<< FIM: ${x.path} >>>`] : [];
+    });
+    const payload = selectedContext.join("\n");
     const rigor = input.data.rigor === "rigoroso"
       ? "Examine também clareza, justificativas e lacunas de contexto, mas nunca especule sem evidências."
       : "Identifique apenas inconsistências e lacunas com evidência sólida nos arquivos lidos.";
 
-    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 45000 });
+    const model = isLocal ? (process.env.OLLAMA_MODEL || "qwen2.5-coder:3b") : (process.env.OPENAI_MODEL || "gpt-4o-mini");
+    // Ollama expõe um endpoint local compatível com a API da OpenAI.
+    const client = new OpenAI({
+      apiKey: isLocal ? "ollama" : (process.env.OPENAI_API_KEY || ""),
+      ...(isLocal ? { baseURL: "http://127.0.0.1:11434/v1" } : {}),
+      timeout: isLocal ? 180_000 : 45_000,
+      maxRetries: 0
+    });
     const completion = await client.chat.completions.create({
       model,
       temperature: 0.1,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: SYSTEM },
-        { role: "user", content: `Repositório: ${project.full_name}\nCritério: ${rigor}\nAtenção: os arquivos abaixo são amostra parcial. Avalie até 8 achados, citando trecho literal.\n${payload}` }
+        { role: "user", content: `Repositório: ${project.full_name}\nCritério: ${rigor}\nAtenção: os arquivos abaixo são amostra parcial. Avalie até ${isLocal ? 3 : 8} achados, citando trecho literal.\n${payload}` }
       ]
     });
     const text = completion.choices[0]?.message?.content;
@@ -92,7 +107,10 @@ export async function POST(request: Request) {
     };
     return NextResponse.json(report, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Falha inesperada durante a análise.";
+    let message = error instanceof Error ? error.message : "Falha inesperada durante a análise.";
+    if ((process.env.AI_PROVIDER || "ollama") === "ollama" && /connection|connect|ECONNREFUSED|fetch failed/i.test(message)) {
+      message = "Não foi possível conectar ao Ollama em localhost:11434. Confira se ele está instalado e em execução e se o modelo foi baixado.";
+    }
     const status = /URL|endereço|públicos|não encontrado|não é válido|não encontramos|muito grande/.test(message) ? 400 : 502;
     return NextResponse.json({ error: message }, { status, headers: { "Cache-Control": "no-store" } });
   }
