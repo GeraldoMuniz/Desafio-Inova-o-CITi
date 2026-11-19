@@ -109,3 +109,5 @@ npm run build
 ## Aviso
 
 Projeto independente desenvolvido como proposta de inovação. Não representa um produto oficial do CITi.
+
+É possível rodar em outros SO, mas foi desenvolvido para Linux/Ubuntu nesse começo (dê preferência para executar no Ubuntu! Caso queira executar em outro SO, não foi testado o passo a passo dos outros ainda).
